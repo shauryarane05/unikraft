@@ -134,3 +134,10 @@ random
 srandom
 initstate
 setstate
+
+# xstat
+__xstat
+__lxstat
+__fxstat
+__fxstatat
+__xmknod

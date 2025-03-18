@@ -629,940 +629,11 @@ ssize_t vfscore_write(struct vfscore_file *fp, const void *buf, size_t count)
 	return bytes;
 }
 
-static int __fxstatat_helper(int ver __unused, int dirfd, const char *pathname,
-		struct stat *st, int flags);
-
-#if UK_LIBC_SYSCALLS
-int __fxstatat(int ver __unused, int dirfd, const char *pathname,
-		struct stat *st, int flags)
-{
-	return __fxstatat_helper(ver, dirfd, pathname, st, flags);
-}
-#ifdef __fxstatat64
-#undef __fxstatat64
-#endif
-
-LFS64(__fxstatat);
-#endif /* UK_LIBC_SYSCALLS */
-
-UK_SYSCALL_R_DEFINE(int, fstatat, int, dirfd, const char*, path,
-				struct stat*, st, int, flags)
-{
-	return __fxstatat_helper(1, dirfd, path, st, flags);
-}
-
-#if UK_LIBC_SYSCALLS
-
-#ifdef fstatat64
-#undef fstatat64
-#endif
-
-LFS64(fstatat);
-#endif /* UK_LIBC_SYSCALLS */
-
-UK_SYSCALL_R_DEFINE(int, newfstatat, int, dirfd, const char*, path,
-				struct stat*, st, int, flags)
-{
-	return __fxstatat_helper(1, dirfd, path, st, flags);
-}
-
-UK_SYSCALL_R_DEFINE(int, flock, int, fd, int, operation)
-{
-	struct vfscore_file *file;
-	int error;
-
-	error = fget(fd, &file);
-	if (error)
-		goto out_error;
-
-	switch (operation) {
-	case LOCK_SH:
-	case LOCK_SH | LOCK_NB:
-	case LOCK_EX:
-	case LOCK_EX | LOCK_NB:
-	case LOCK_UN:
-		break;
-	default:
-		error = EINVAL;
-		goto out_error;
-	}
-
-	return 0;
-
-	out_error:
-	return -error;
-}
-
-UK_TRACEPOINT(trace_vfs_readdir, "%d %#x", int, struct dirent*);
-UK_TRACEPOINT(trace_vfs_readdir_ret, "");
-UK_TRACEPOINT(trace_vfs_readdir_err, "%d", int);
-
-UK_TRACEPOINT(trace_vfs_readdir64, "%d %p", int, struct dirent64*);
-UK_TRACEPOINT(trace_vfs_readdir_ret64, "");
-UK_TRACEPOINT(trace_vfs_readdir_err64, "%d", int);
-
-struct __dirstream
-{
-	int fd;
-};
-
-DIR *opendir(const char *path)
-{
-	DIR *dir;
-	struct stat st;
-	mode_t mode = 0;
-
-	dir = malloc(sizeof(*dir));
-	if (!dir) {
-		errno = ENOMEM;
-		goto out_err;
-	}
-
-	dir->fd = uk_syscall_e_open((long int)path, O_RDONLY, mode);
-	if (dir->fd < 0)
-		goto out_free_dir;
-
-	if (fstat(dir->fd, &st) < 0)
-		goto out_free_dir;
-
-	if (!S_ISDIR(st.st_mode)) {
-		errno = ENOTDIR;
-		goto out_free_dir;
-	}
-
-	return dir;
-
-out_free_dir:
-	free(dir);
-out_err:
-	return NULL;
-}
-
-DIR *fdopendir(int fd)
-{
-	DIR *dir;
-	struct stat st;
-	if (fstat(fd, &st) < 0) {
-		return NULL;
-	}
-	if (!S_ISDIR(st.st_mode)) {
-		errno = ENOTDIR;
-		return NULL;
-	}
-	dir = malloc(sizeof(*dir));
-	if (!dir) {
-		errno = ENOMEM;
-		return NULL;
-	}
-	dir->fd = fd;
-	return dir;
-
-}
-
-int dirfd(DIR *dirp)
-{
-	if (!dirp) {
-		return libc_error(EINVAL);
-	}
-
-	return dirp->fd;
-}
-
-int closedir(DIR *dir)
-{
-	close(dir->fd);
-	free(dir);
-	return 0;
-}
-
-#if CONFIG_LIBVFSCORE_NONLARGEFILE
-int scandir(const char *path, struct dirent ***res,
-	int (*sel)(const struct dirent *),
-	int (*cmp)(const struct dirent **, const struct dirent **))
-{
-	DIR *d = opendir(path);
-	struct dirent *de, **names=0, **tmp;
-	size_t cnt=0, len=0;
-	int old_errno = errno;
-
-	if (!d)
-		return -1;
-
-	while ((errno=0), (de = readdir(d))) {
-		if (sel && !sel(de))
-			continue;
-		if (cnt >= len) {
-			len = 2*len+1;
-			if (len > SIZE_MAX/sizeof(*names))
-				break;
-			tmp = realloc(names, len * sizeof(*names));
-			if (!tmp)
-				break;
-			names = tmp;
-		}
-		names[cnt] = malloc(de->d_reclen);
-		if (!names[cnt])
-			break;
-		memcpy(names[cnt++], de, de->d_reclen);
-	}
-
-	closedir(d);
-
-	if (errno) {
-		if (names) {
-			while (cnt-->0)
-				free(names[cnt]);
-			free(names);
-		}
-		return -1;
-	}
-	errno = old_errno;
-
-	if (cmp)
-		qsort(names, cnt, sizeof *names, (int (*)(const void *, const void *))cmp);
-	*res = names;
-	return cnt;
-}
-#else /* !CONFIG_LIBVFSCORE_NONLARGEFILE */
-int scandir(const char *path, struct dirent ***res,
-	int (*sel)(const struct dirent *),
-	int (*cmp)(const struct dirent **, const struct dirent **))
-	__attribute__((alias("scandir64")));
-#endif /* !CONFIG_LIBVFSCORE_NONLARGEFILE */
-
-#ifdef scandir64
-#undef scandir64
-#endif
-int scandir64(const char *path, struct dirent64 ***res,
-	int (*sel)(const struct dirent64 *),
-	int (*cmp)(const struct dirent64 **, const struct dirent64 **))
-{
-	struct dirent64 *de, **names = 0, **tmp;
-	size_t cnt = 0, len = 0;
-	int old_errno = errno;
-	DIR *d;
-
-	d = opendir(path);
-	if (!d)
-		return -1;
-
-	de = readdir64(d);
-	while (de != NULL) {
-		if (sel && !sel(de))
-			continue;
-
-		if (cnt >= len) {
-			len = 2 * len + 1;
-			if (len > SIZE_MAX / sizeof(*names))
-				break;
-
-			tmp = realloc(names, len * sizeof(*names));
-			if (!tmp)
-				break;
-			names = tmp;
-		}
-
-		names[cnt] = malloc(de->d_reclen);
-		if (unlikely(!names[cnt]))
-			break;
-
-		memcpy(names[cnt++], de, de->d_reclen);
-
-		de = readdir64(d);
-	}
-
-	closedir(d);
-
-	if (unlikely(errno)) {
-		if (names) {
-			while (cnt-- > 0)
-				free(names[cnt]);
-			free(names);
-		}
-
-		return -1;
-	}
-	errno = old_errno;
-
-	if (cmp)
-		qsort(names, cnt, sizeof(*names),
-		      (int (*)(const void *, const void *))cmp);
-
-	*res = names;
-	return cnt;
-}
-
-#if CONFIG_LIBVFSCORE_NONLARGEFILE
-UK_TRACEPOINT(trace_vfs_getdents, "%d %p %hu", int, struct dirent*, size_t);
-UK_TRACEPOINT(trace_vfs_getdents_ret, "");
-UK_TRACEPOINT(trace_vfs_getdents_err, "%d", int);
-
-UK_SYSCALL_R_DEFINE(int, getdents, int, fd, struct dirent*, dirp,
-					size_t, count) {
-	trace_vfs_getdents(fd, dirp, count);
-	if (dirp == NULL || count == 0)
-		return 0;
-
-	DIR dir = {
-		.fd = fd
-	};
-
-	size_t i = 0;
-	struct dirent entry, *result;
-	int error;
-
-	while ((i + 1) * sizeof(struct dirent) <= count) {
-		error = readdir_r(&dir, &entry, &result);
-		if (error) {
-			trace_vfs_getdents_err(error);
-			return -error;
-
-		} else
-			trace_vfs_getdents_ret();
-
-		if (result != NULL) {
-			memcpy(dirp + i, result, sizeof(struct dirent));
-			i++;
-
-		} else
-			break;
-
-	}
-
-	return (i * sizeof(struct dirent));
-}
-#endif /* CONFIG_LIBVFSCORE_NONLARGEFILE */
-
-UK_TRACEPOINT(trace_vfs_getdents64, "%d %p %hu", int, struct dirent64 *, size_t);
-UK_TRACEPOINT(trace_vfs_getdents64_ret, "");
-UK_TRACEPOINT(trace_vfs_getdents64_err, "%d", int);
-
-UK_SYSCALL_R_DEFINE(int, getdents64, int, fd, struct dirent64 *, dirp,
-					size_t, count) {
-	trace_vfs_getdents64(fd, dirp, count);
-	if (dirp == NULL || count == 0)
-		return 0;
-
-	DIR dir = {
-		.fd = fd
-	};
-
-	size_t i = 0;
-	struct dirent64 entry, *result;
-	int error;
-
-	while (((i + 1) * sizeof(struct dirent64)) < count) {
-		error = readdir64_r(&dir, &entry, &result);
-		if (error) {
-			trace_vfs_getdents64_err(error);
-			return -error;
-
-		} else
-			trace_vfs_getdents64_ret();
-
-		if (result != NULL) {
-			memcpy(dirp + i, result, sizeof(struct dirent64));
-			i++;
-
-		} else
-			break;
-	}
-
-	return (i * sizeof(struct dirent64));
-}
-
-/**
- * If we use an old libc version, that does not use the largefile syscalls as
- * the default ones, we want to use proper Linux `dirent` and `dirent64`
- * structures, in order to maintain compatibility.
- * Since the filesystem `READDIR` vop uses `dirent64`, we will convert to
- * a `dirent` structure within the `readdir_r` call.
- *
- * When this is not the case, we can simply use `#define dirent dirent64` and
- * alias the `readdir*` functions to their `*64` equivalent.
- */
-#if CONFIG_LIBVFSCORE_NONLARGEFILE
-struct dirent *readdir(DIR *dir)
-{
-	static __thread struct dirent entry;
-	struct dirent *result;
-
-	errno = readdir_r(dir, &entry, &result);
-
-	return result;
-}
-
-int readdir_r(DIR *dir, struct dirent *entry, struct dirent **result)
-{
-	/**
-	 * `sys_readdir()` will end up calling `VOP_READDIR`, which expects
-	 * a dirent64 structure instead of the `struct dirent` entry parameter.
-	 */
-	struct dirent64 entry64;
-	struct vfscore_file *fp;
-	int error;
-
-	*result = NULL;
-
-	// Our dirent has (like Linux) a d_reclen field, but a constant size.
-	entry->d_reclen = sizeof(*entry);
-
-	trace_vfs_readdir(dir->fd, entry);
-	error = fget(dir->fd, &fp);
-	if (unlikely(error))
-		return error;
-
-	error = sys_readdir(fp, &entry64);
-	fdrop(fp);
-	if (unlikely(error)) {
-		trace_vfs_readdir_err(error);
-
-		return error == ENOENT ? 0 : error;
-	}
-
-	trace_vfs_readdir_ret();
-
-	entry->d_ino = entry64.d_ino;
-	entry->d_type = entry64.d_type;
-	entry->d_off = entry64.d_off;
-	memcpy(entry->d_name, entry64.d_name, sizeof(entry64.d_name));
-
-	*result = entry;
-
-	return 0;
-}
-#else /* !CONFIG_LIBVFSCORE_NONLARGEFILE */
-struct dirent *readdir(DIR *dir) __attribute__((alias("readdir64")));
-int readdir_r(DIR *dir, struct dirent *entry, struct dirent **result)
-	 __attribute__((alias("readdir64_r")));
-#endif /* !CONFIG_LIBVFSCORE_NONLARGEFILE */
-
-#ifdef readdir64_r
-#undef readdir64_r
-#endif
-int readdir64_r(DIR *dir, struct dirent64 *entry,
-		struct dirent64 **result)
-{
-	struct vfscore_file *fp;
-	int error;
-
-	*result = NULL;
-
-	// Our dirent has (like Linux) a d_reclen field, but a constant size.
-	entry->d_reclen = sizeof(*entry);
-
-	trace_vfs_readdir64(dir->fd, entry);
-	error = fget(dir->fd, &fp);
-	if (unlikely(error))
-		return error;
-
-	error = sys_readdir(fp, entry);
-	fdrop(fp);
-	if (unlikely(error)) {
-		trace_vfs_readdir_err64(error);
-
-		return error == ENOENT ? 0 : error;
-	}
-
-	trace_vfs_readdir_ret64();
-
-	*result = entry;
-
-	return 0;
-}
-
-#ifdef readdir64
-#undef readdir64
-#endif
-struct dirent64 *readdir64(DIR *dir)
-{
-	static __thread struct dirent64 entry;
-	struct dirent64 *result;
-
-	errno = readdir64_r(dir, &entry, &result);
-
-	return result;
-}
-
-void rewinddir(DIR *dirp)
-{
-	struct vfscore_file *fp;
-
-	int error = fget(dirp->fd, &fp);
-	if (error) {
-		// POSIX specifies that what rewinddir() does in the case of error
-		// is undefined...
-		return;
-	}
-
-	sys_rewinddir(fp);
-	// Again, error code from sys_rewinddir() is ignored.
-	fdrop(fp);
-}
-
-long telldir(DIR *dirp)
-{
-	struct vfscore_file *fp;
-	int error = fget(dirp->fd, &fp);
-	if (error) {
-		return libc_error(error);
-	}
-
-	long loc;
-	error = sys_telldir(fp, &loc);
-	fdrop(fp);
-	if (error) {
-		return libc_error(error);
-	}
-	return loc;
-}
-
-void seekdir(DIR *dirp, long loc)
-{
-	struct vfscore_file *fp;
-	int error = fget(dirp->fd, &fp);
-	if (error) {
-		// POSIX specifies seekdir() cannot return errors.
-		return;
-	}
-	sys_seekdir(fp, loc);
-	// Again, error code from sys_seekdir() is ignored.
-	fdrop(fp);
-}
-
-UK_TRACEPOINT(trace_vfs_mkdir, "\"%s\" 0%0o", const char*, mode_t);
-UK_TRACEPOINT(trace_vfs_mkdir_ret, "");
-UK_TRACEPOINT(trace_vfs_mkdir_err, "%d", int);
-
-UK_SYSCALL_R_DEFINE(int, mkdir, const char*, pathname, mode_t, mode)
-{
-	struct task *t = main_task;
-	char path[PATH_MAX];
-	int error;
-
-	mode = apply_umask(mode);
-
-	trace_vfs_mkdir(pathname, mode);
-	if ((error = task_conv(t, pathname, VWRITE, path)) != 0)
-		goto out_errno;
-
-	error = sys_mkdir(path, mode);
-	if (error)
-		goto out_errno;
-	trace_vfs_mkdir_ret();
-	return 0;
-out_errno:
-	trace_vfs_mkdir_err(error);
-	return -error;
-}
-
-UK_SYSCALL_R_DEFINE(int, mkdirat, int, dirfd,
-		    const char*, pathname, mode_t, mode)
-{
-	struct vfscore_file *fp;
-	struct vnode *vp;
-	char p[PATH_MAX];
-	int error;
-
-	if (pathname[0] == '/' || dirfd == AT_FDCWD)
-		return uk_syscall_do_mkdir((long) pathname, (long) mode);
-
-	error = fget(dirfd, &fp);
-	if (error)
-		return error;
-
-	vp = fp->f_dentry->d_vnode;
-	vn_lock(vp);
-
-	/* build absolute path */
-	strlcpy(p, fp->f_dentry->d_mount->m_path, PATH_MAX);
-	strlcat(p, fp->f_dentry->d_path, PATH_MAX);
-	strlcat(p, "/", PATH_MAX);
-	strlcat(p, pathname, PATH_MAX);
-
-	vn_unlock(vp);
-	fdrop(fp);
-
-	error = uk_syscall_do_mkdir((long) p, (long) mode);
-
-	return error;
-}
-
-UK_TRACEPOINT(trace_vfs_rmdir, "\"%s\"", const char*);
-UK_TRACEPOINT(trace_vfs_rmdir_ret, "");
-UK_TRACEPOINT(trace_vfs_rmdir_err, "%d", int);
-
-UK_SYSCALL_R_DEFINE(int, rmdir, const char*, pathname)
-{
-	struct task *t = main_task;
-	char path[PATH_MAX];
-	int error;
-
-	trace_vfs_rmdir(pathname);
-	error = ENOENT;
-	if (pathname == NULL)
-		goto out_error;
-	if ((error = task_conv(t, pathname, VWRITE, path)) != 0)
-		goto out_error;
-
-	error = sys_rmdir(path);
-	if (error)
-		goto out_error;
-	trace_vfs_rmdir_ret();
-	return 0;
-
-	out_error:
-	trace_vfs_rmdir_err(error);
-	return -error;
-}
-
-static void
-get_last_component(const char *path, char *dst)
-{
-	int pos = strlen(path) - 1;
-
-	while (pos >= 0 && path[pos] == '/')
-		pos--;
-
-	int component_end = pos;
-
-	while (pos >= 0 && path[pos] != '/')
-		pos--;
-
-	int component_start = pos + 1;
-
-	int len = component_end - component_start + 1;
-	memcpy(dst, path + component_start, len);
-	dst[len] = 0;
-}
-
-static int null_or_empty(const char *str)
-{
-	return str == NULL || *str == '\0';
-}
-
-UK_TRACEPOINT(trace_vfs_rename, "\"%s\" \"%s\"", const char*, const char*);
-UK_TRACEPOINT(trace_vfs_rename_ret, "");
-UK_TRACEPOINT(trace_vfs_rename_err, "%d", int);
-
-UK_SYSCALL_R_DEFINE(int, rename, const char*, oldpath, const char*, newpath)
-{
-	trace_vfs_rename(oldpath, newpath);
-	struct task *t = main_task;
-	char src[PATH_MAX];
-	char dest[PATH_MAX];
-	int error;
-
-	error = ENOENT;
-	if (null_or_empty(oldpath) || null_or_empty(newpath))
-		goto out_error;
-
-	get_last_component(oldpath, src);
-	if (!strcmp(src, ".") || !strcmp(src, "..")) {
-		error = EINVAL;
-		goto out_error;
-	}
-
-	get_last_component(newpath, dest);
-	if (!strcmp(dest, ".") || !strcmp(dest, "..")) {
-		error = EINVAL;
-		goto out_error;
-	}
-
-	if ((error = task_conv(t, oldpath, VREAD, src)) != 0)
-		goto out_error;
-
-	if ((error = task_conv(t, newpath, VWRITE, dest)) != 0)
-		goto out_error;
-
-	error = sys_rename(src, dest);
-	if (error)
-		goto out_error;
-	trace_vfs_rename_ret();
-	return 0;
-
-	out_error:
-	trace_vfs_rename_err(error);
-	return -error;
-}
-
-UK_TRACEPOINT(trace_vfs_renameat, "\"%s\" \"%s\"", const char*, const char*);
-UK_TRACEPOINT(trace_vfs_renameat_ret, "");
-UK_TRACEPOINT(trace_vfs_renameat_err, "%d", int);
-
-UK_SYSCALL_R_DEFINE(int, renameat,
-	int, olddirfd, const char*, oldpath, int, newdirfd, const char*, newpath)
-{
-	char src[PATH_MAX];
-	char dest[PATH_MAX];
-
-	if (!(oldpath[0] == '/' || olddirfd == AT_FDCWD)) {
-		struct vfscore_file *fp;
-		struct vnode *vp;
-		int error = fget(olddirfd, &fp);
-
-		if (error)
-			return -error;
-
-		vp = fp->f_dentry->d_vnode;
-
-		vn_lock(vp);
-
-		/* build absolute path */
-		strlcpy(src, fp->f_dentry->d_mount->m_path, PATH_MAX);
-		strlcat(src, fp->f_dentry->d_path, PATH_MAX);
-		strlcat(src, "/", PATH_MAX);
-		strlcat(src, oldpath, PATH_MAX);
-
-		vn_unlock(vp);
-		fdrop(fp);
-	} else {
-		strlcpy(src, oldpath, PATH_MAX);
-	}
-
-	if (!(newpath[0] == '/' || newdirfd == AT_FDCWD)) {
-		struct vfscore_file *fp;
-		struct vnode *vp;
-		int error = fget(newdirfd, &fp);
-
-		if (error)
-			return -error;
-
-		vp = fp->f_dentry->d_vnode;
-		vn_lock(vp);
-
-		/* build absolute path */
-		strlcpy(dest, fp->f_dentry->d_mount->m_path, PATH_MAX);
-		strlcat(dest, fp->f_dentry->d_path, PATH_MAX);
-		strlcat(dest, "/", PATH_MAX);
-		strlcat(dest, newpath, PATH_MAX);
-
-		vn_unlock(vp);
-		fdrop(fp);
-	} else {
-		strlcpy(dest, newpath, PATH_MAX);
-	}
-
-	return sys_rename(src, dest);
-}
-
-UK_TRACEPOINT(trace_vfs_chdir, "\"%s\"", const char*);
-UK_TRACEPOINT(trace_vfs_chdir_ret, "");
-UK_TRACEPOINT(trace_vfs_chdir_err, "%d", int);
-
-static int
-__do_fchdir(struct vfscore_file *fp, struct task *t)
-{
-	struct vfscore_file *old = NULL;
-
-	UK_ASSERT(t);
-
-	if (t->t_cwdfp) {
-		old = t->t_cwdfp;
-	}
-
-	/* Do the actual chdir operation here */
-	int error = sys_fchdir(fp, t->t_cwd);
-
-	t->t_cwdfp = fp;
-	if (old) {
-		fdrop(old);
-	}
-
-	return error;
-}
-
-UK_SYSCALL_R_DEFINE(int, chdir, const char*, pathname)
-{
-	trace_vfs_chdir(pathname);
-	struct task *t = main_task;
-	char path[PATH_MAX];
-	struct vfscore_file *fp;
-	int error;
-
-	error = ENOENT;
-	if (pathname == NULL)
-		goto out_error;
-
-	if ((error = task_conv(t, pathname, VREAD, path)) != 0)
-		goto out_error;
-
-	/* Check if directory exits */
-	error = sys_open(path, O_DIRECTORY, 0, &fp);
-	if (error) {
-		goto out_error;
-	}
-
-	error = __do_fchdir(fp, t);
-	if (error) {
-		fdrop(fp);
-		goto out_error;
-	}
-
-	trace_vfs_chdir_ret();
-	return 0;
-
-	out_error:
-	trace_vfs_chdir_err(errno);
-	return -error;
-}
-
-UK_TRACEPOINT(trace_vfs_fchdir, "%d", int);
-UK_TRACEPOINT(trace_vfs_fchdir_ret, "");
-UK_TRACEPOINT(trace_vfs_fchdir_err, "%d", int);
-
-UK_SYSCALL_R_DEFINE(int, fchdir, int, fd)
-{
-	trace_vfs_fchdir(fd);
-	struct task *t = main_task;
-	struct vfscore_file *fp;
-	int error;
-
-	error = fget(fd, &fp);
-	if (error)
-		goto out_error;
-
-	error = __do_fchdir(fp, t);
-	if (error) {
-		fdrop(fp);
-		goto out_error;
-	}
-
-	trace_vfs_fchdir_ret();
-	return 0;
-
-	out_error:
-	trace_vfs_fchdir_err(error);
-	return -error;
-}
-
-UK_TRACEPOINT(trace_vfs_link, "\"%s\" \"%s\"", const char*, const char*);
-UK_TRACEPOINT(trace_vfs_link_ret, "");
-UK_TRACEPOINT(trace_vfs_link_err, "%d", int);
-
-UK_SYSCALL_R_DEFINE(int, link, const char*, oldpath, const char*, newpath)
-{
-	struct task *t = main_task;
-	char path1[PATH_MAX];
-	char path2[PATH_MAX];
-	int error;
-
-	trace_vfs_link(oldpath, newpath);
-
-	error = ENOENT;
-	if (oldpath == NULL || newpath == NULL)
-		goto out_error;
-	if ((error = task_conv(t, oldpath, VWRITE, path1)) != 0)
-		goto out_error;
-	if ((error = task_conv(t, newpath, VWRITE, path2)) != 0)
-		goto out_error;
-
-	error = sys_link(path1, path2);
-	if (error)
-		goto out_error;
-
-	trace_vfs_link_ret();
-	return 0;
-
-	out_error:
-	trace_vfs_link_err(error);
-	return -error;
-}
-
-
-UK_TRACEPOINT(trace_vfs_symlink, "oldpath=%s, newpath=%s", const char*,
-	      const char*);
-UK_TRACEPOINT(trace_vfs_symlink_ret, "");
-UK_TRACEPOINT(trace_vfs_symlink_err, "errno=%d", int);
-
-UK_SYSCALL_R_DEFINE(int, symlink, const char*, oldpath, const char*, newpath)
-{
-	int error;
-
-	trace_vfs_symlink(oldpath, newpath);
-
-	error = ENOENT;
-	if (oldpath == NULL || newpath == NULL) {
-		trace_vfs_symlink_err(error);
-		return (-ENOENT);
-	}
-
-	error = sys_symlink(oldpath, newpath);
-	if (error) {
-		trace_vfs_symlink_err(error);
-		return (-error);
-	}
-
-	trace_vfs_symlink_ret();
-	return 0;
-}
-
-UK_TRACEPOINT(trace_vfs_unlink, "\"%s\"", const char*);
-UK_TRACEPOINT(trace_vfs_unlink_ret, "");
-UK_TRACEPOINT(trace_vfs_unlink_err, "%d", int);
-
-UK_SYSCALL_R_DEFINE(int, unlink, const char*, pathname)
-{
-	trace_vfs_unlink(pathname);
-	struct task *t = main_task;
-	char path[PATH_MAX];
-	int error;
-
-	error = ENOENT;
-	if (pathname == NULL)
-		goto out_errno;
-	if ((error = task_conv(t, pathname, VWRITE, path)) != 0)
-		goto out_errno;
-
-	error = sys_unlink(path);
-	if (error)
-		goto out_errno;
-	trace_vfs_unlink_ret();
-	return 0;
-out_errno:
-	trace_vfs_unlink_err(error);
-	return -error;
-}
-
-UK_SYSCALL_R_DEFINE(int, unlinkat, int, dirfd, const char*, pathname, int, flags)
-{
-	if (pathname[0] == '/' || dirfd == AT_FDCWD) {
-		if (flags & AT_REMOVEDIR)
-			return uk_syscall_do_rmdir((long)pathname);
-		else
-			return uk_syscall_do_unlink((long)pathname);
-	}
-
-	struct vfscore_file *fp;
-	int error = fget(dirfd, &fp);
-	if (error)
-		return -error;
-
-	struct vnode *vp = fp->f_dentry->d_vnode;
-	vn_lock(vp);
-
-	char p[PATH_MAX];
-	/* build absolute path */
-	strlcpy(p, fp->f_dentry->d_mount->m_path, PATH_MAX);
-	strlcat(p, fp->f_dentry->d_path, PATH_MAX);
-	strlcat(p, "/", PATH_MAX);
-	strlcat(p, pathname, PATH_MAX);
-
-	vn_unlock(vp);
-	fdrop(fp);
-
-	if (flags & AT_REMOVEDIR)
-		return uk_syscall_do_rmdir((long)p);
-	else
-		return uk_syscall_do_unlink((long)p);
-}
-
 UK_TRACEPOINT(trace_vfs_stat, "\"%s\" %#x", const char*, struct stat*);
 UK_TRACEPOINT(trace_vfs_stat_ret, "");
 UK_TRACEPOINT(trace_vfs_stat_err, "%d", int);
 
-static int __xstat_helper(int ver __unused, const char *pathname,
-		struct stat *st)
+UK_SYSCALL_R_DEFINE(int, stat, const char*, pathname, struct stat*, st)
 {
 	struct task *t = main_task;
 	char path[PATH_MAX];
@@ -1570,40 +641,26 @@ static int __xstat_helper(int ver __unused, const char *pathname,
 
 	trace_vfs_stat(pathname, st);
 
+	if (pathname == NULL || st == NULL) {
+		return -EFAULT;
+	}
+
 	error = task_conv(t, pathname, 0, path);
-	if (error)
-		goto out_errno;
+	if (error) {
+		goto out_error;
+	}
 
 	error = sys_stat(path, st);
-	if (error)
-		goto out_errno;
+	if (error) {
+		goto out_error;
+	}
+	
 	trace_vfs_stat_ret();
 	return 0;
 
-	out_errno:
+out_error:
 	trace_vfs_stat_err(error);
 	return -error;
-}
-
-#if UK_LIBC_SYSCALLS
-static int __xstat(int ver __unused, const char *pathname,
-		struct stat *st)
-{
-	return __xstat_helper(ver, pathname, st);
-}
-#ifdef __xstat64
-#undef __xstat64
-#endif
-
-LFS64(__xstat);
-#endif /* UK_LIBC_SYSCALLS */
-
-UK_SYSCALL_R_DEFINE(int, stat, const char*, pathname, struct stat*, st)
-{
-	if (!pathname) {
-		return -EINVAL;
-	}
-	return __xstat_helper(1, pathname, st);
 }
 
 #ifdef stat64
@@ -1617,13 +674,17 @@ UK_TRACEPOINT(trace_vfs_lstat, "pathname=%s, stat=%#x", const char*,
 UK_TRACEPOINT(trace_vfs_lstat_ret, "");
 UK_TRACEPOINT(trace_vfs_lstat_err, "errno=%d", int);
 
-int __lxstat_helper(int ver __unused, const char *pathname, struct stat *st)
+UK_SYSCALL_R_DEFINE(int, lstat, const char*, pathname, struct stat*, st)
 {
 	struct task *t = main_task;
 	char path[PATH_MAX];
 	int error;
 
 	trace_vfs_lstat(pathname, st);
+
+	if (pathname == NULL || st == NULL) {
+		return -EFAULT;
+	}
 
 	error = task_conv(t, pathname, 0, path);
 	if (error) {
@@ -1638,72 +699,9 @@ int __lxstat_helper(int ver __unused, const char *pathname, struct stat *st)
 	trace_vfs_lstat_ret();
 	return 0;
 
-	out_error:
+out_error:
 	trace_vfs_lstat_err(error);
 	return -error;
-}
-
-#if UK_LIBC_SYSCALLS
-int __lxstat(int ver __unused, const char *pathname, struct stat *st)
-{
-	return __lxstat_helper(1, pathname, st);
-}
-
-#ifdef __lxstat64
-#undef __lxstat64
-#endif
-
-LFS64(__lxstat);
-#else
-int __lxstat(int ver, const char *pathname, struct stat *st);
-#endif /* UK_LIBC_SYSCALLS */
-
-UK_SYSCALL_R_DEFINE(int, lstat, const char*, pathname, struct stat*, st)
-{
-	return __lxstat_helper(1, pathname, st);
-}
-
-/* The fstat syscall is no longer implemented here; need to declare */
-long uk_syscall_do_fstat(long dirfd, long st);
-
-static int __fxstatat_helper(int ver __unused, int dirfd, const char *pathname,
-		struct stat *st, int flags)
-{
-	if (!pathname || !st)
-		return -EFAULT;
-	if (pathname[0] == '/' || dirfd == AT_FDCWD) {
-		return uk_syscall_do_stat((long) pathname, (long) st);
-	}
-	// If AT_EMPTY_PATH and pathname is an empty string, fstatat() operates on
-	// dirfd itself, and in that case it doesn't have to be a directory.
-	if ((flags & AT_EMPTY_PATH) && !pathname[0]) {
-		return uk_syscall_do_fstat((long) dirfd, (long) st);
-	}
-
-	struct vfscore_file *fp;
-	int error = fget(dirfd, &fp);
-	if (error)
-		return -error;
-
-	struct vnode *vp = fp->f_dentry->d_vnode;
-	vn_lock(vp);
-
-	char p[PATH_MAX];
-	/* build absolute path */
-	strlcpy(p, fp->f_dentry->d_mount->m_path, PATH_MAX);
-	strlcat(p, fp->f_dentry->d_path, PATH_MAX);
-	strlcat(p, "/", PATH_MAX);
-	strlcat(p, pathname, PATH_MAX);
-
-	vn_unlock(vp);
-	fdrop(fp);
-
-	if (flags & AT_SYMLINK_NOFOLLOW)
-		error = uk_syscall_do_lstat((long) p, (long) st);
-	else
-		error = uk_syscall_do_stat((long) p, (long) st);
-
-	return error;
 }
 
 #ifdef lstat64
@@ -1711,6 +709,9 @@ static int __fxstatat_helper(int ver __unused, int dirfd, const char *pathname,
 #endif
 
 LFS64(lstat);
+
+/* The fstat syscall is no longer implemented here; need to declare */
+long uk_syscall_do_fstat(long dirfd, long st);
 
 UK_TRACEPOINT(trace_vfs_statfs, "\"%s\" %#x", const char*, struct statfs*);
 UK_TRACEPOINT(trace_vfs_statfs_ret, "");
@@ -2177,7 +1178,7 @@ UK_SYSCALL_DEFINE(ssize_t, readlink, const char *, pathname, char *, buf, size_t
 	return -1;
 }
 
-UK_TRACEPOINT(trace_vfs_utimes, "\"%s\"", const char*);
+UK_TRACEPOINT(trace_vfs_utimes, "\"%s\"");
 UK_TRACEPOINT(trace_vfs_utimes_ret, "");
 UK_TRACEPOINT(trace_vfs_utimes_err, "%d", int);
 
@@ -2245,7 +1246,7 @@ out_errno:
 	return -1;
 }
 
-UK_TRACEPOINT(trace_vfs_utimensat, "\"%s\"", const char*);
+UK_TRACEPOINT(trace_vfs_utimensat, "\"%s\"");
 UK_TRACEPOINT(trace_vfs_utimensat_ret, "");
 UK_TRACEPOINT(trace_vfs_utimensat_err, "%d", int);
 
@@ -2267,7 +1268,7 @@ UK_SYSCALL_R_DEFINE(int, utimensat, int, dirfd, const char*, pathname, const str
 }
 
 #if UK_LIBC_SYSCALLS
-UK_TRACEPOINT(trace_vfs_futimens, "%d", int);
+UK_TRACEPOINT(trace_vfs_futimens, "%d");
 UK_TRACEPOINT(trace_vfs_futimens_ret, "");
 UK_TRACEPOINT(trace_vfs_futimens_err, "%d", int);
 
@@ -2512,3 +1513,134 @@ static void vfscore_init(void)
 }
 
 UK_CTOR_PRIO(vfscore_init, 1);
+
+int stat(const char *path, struct stat *st) {
+    struct vnode *vp;
+    int error;
+
+    UK_SYSCALL_RET1(stat, path, st);
+
+    if (path == NULL || st == NULL) {
+        return -EFAULT;
+    }
+
+    if (path[0] == '\0') {
+        return -ENOENT;
+    }
+
+    error = vfscore_lookup(path, 0, &vp);
+    if (error) {
+        return error;
+    }
+
+    error = vfscore_vn_getattr(vp, st);
+    vfscore_vput(vp);
+    return error;
+}
+
+int lstat(const char *path, struct stat *st) {
+    struct vnode *vp;
+    int error;
+
+    UK_SYSCALL_RET1(lstat, path, st);
+
+    if (path == NULL || st == NULL) {
+        return -EFAULT;
+    }
+
+    if (path[0] == '\0') {
+        return -ENOENT;
+    }
+
+    error = vfscore_lookup(path, LOOKUP_NOFOLLOW, &vp);
+    if (error) {
+        return error;
+    }
+
+    error = vfscore_vn_getattr(vp, st);
+    vfscore_vput(vp);
+    return error;
+}
+
+int fstatat(int dirfd, const char *path, struct stat *st, int flags) {
+    struct vnode *vp;
+    int error;
+
+    UK_SYSCALL_RET1(fstatat, dirfd, path, st, flags);
+
+    if (path == NULL || st == NULL) {
+        return -EFAULT;
+    }
+
+    if (path[0] == '\0') {
+        return -ENOENT;
+    }
+
+    error = vfscore_lookupat(dirfd, path, flags, &vp);
+    if (error) {
+        return error;
+    }
+
+    error = vfscore_vn_getattr(vp, st);
+    vfscore_vput(vp);
+    return error;
+}
+
+UK_SYSCALL_R_DEFINE(int, fstatat, int, dirfd, const char*, path,
+				struct stat*, st, int, flags)
+{
+    int error;
+
+    if (!path || !st)
+        return -EFAULT;
+    
+    if (path[0] == '/' || dirfd == AT_FDCWD) {
+        if (flags & AT_SYMLINK_NOFOLLOW)
+            return uk_syscall_do_lstat((long) path, (long) st);
+        else
+            return uk_syscall_do_stat((long) path, (long) st);
+    }
+    
+    // If AT_EMPTY_PATH and pathname is an empty string, fstatat() operates on
+    // dirfd itself, and in that case it doesn't have to be a directory.
+    if ((flags & AT_EMPTY_PATH) && !path[0]) {
+        return uk_syscall_do_fstat((long) dirfd, (long) st);
+    }
+
+    struct vfscore_file *fp;
+    error = fget(dirfd, &fp);
+    if (error)
+        return -error;
+
+    struct vnode *vp = fp->f_dentry->d_vnode;
+    vn_lock(vp);
+
+    char p[PATH_MAX];
+    /* build absolute path */
+    strlcpy(p, fp->f_dentry->d_mount->m_path, PATH_MAX);
+    strlcat(p, fp->f_dentry->d_path, PATH_MAX);
+    strlcat(p, "/", PATH_MAX);
+    strlcat(p, path, PATH_MAX);
+
+    vn_unlock(vp);
+    fdrop(fp);
+
+    if (flags & AT_SYMLINK_NOFOLLOW)
+        error = uk_syscall_do_lstat((long) p, (long) st);
+    else
+        error = uk_syscall_do_stat((long) p, (long) st);
+
+    return error;
+}
+
+#ifdef fstatat64
+#undef fstatat64
+#endif
+
+LFS64(fstatat);
+
+UK_SYSCALL_R_DEFINE(int, newfstatat, int, dirfd, const char*, path,
+                    struct stat*, st, int, flags)
+{
+    return uk_syscall_do_fstatat((long) dirfd, (long) path, (long) st, (long) flags);
+}
